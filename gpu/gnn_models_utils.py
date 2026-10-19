@@ -112,10 +112,30 @@ def weighted_mse_loss(pred, target):
     loss = weights * (pred - target) ** 2
     return loss.mean()
 
-import os
-import random
-import numpy as np
-import torch
+def build_pyg_dataset(smiles_array, gen_array, y_array, cache=None, use_cache=True):
+    dataset = []
+    for i in range(len(smiles_array)):
+        smiles = smiles_array[i]
+        
+        # Entweder aus dem Cache holen oder from scratch bauen
+        if use_cache and cache is not None:
+            base_data = cache.get(smiles)
+            # Wichtig: Wenn er aus dem Cache kommt, müssen wir ihn klonen, 
+            # damit wir nicht das Cache-Original überschreiben
+            if base_data is not None:
+                data = base_data.clone()
+            else:
+                data = None
+        else:
+            # Graph direkt neu berechnen (kein Klonen nötig, da es ein neues Objekt ist)
+            data = smiles_to_graph(smiles)
+            
+        if data is not None:
+            data.gene = torch.tensor(gen_array[i], dtype=torch.float32).unsqueeze(0)
+            data.y_true = torch.tensor([y_array[i]], dtype=torch.float32)
+            dataset.append(data)
+
+    return dataset
 
 def set_seed(seed: int):    
     random.seed(seed)
@@ -128,10 +148,8 @@ def set_seed(seed: int):
         torch.backends.cudnn.benchmark = False
         
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch.mps.manual_seed(seed)
-        
+        torch.mps.manual_seed(seed)  
     #torch.use_deterministic_algorithms(True, warn_only=True)
-
 
 # ==========================================
 # 3. Models
@@ -162,7 +180,6 @@ class ModularTokenEncoder(nn.Module):
             sub_x = x[:, idx]
             token_list.append(proj(sub_x))
         return torch.stack(token_list, dim=1)
-
 
 class GCNDrugEncoder(nn.Module):
     def __init__(self, node_feature_dim, hidden_dim, dropout=0.1):
@@ -221,11 +238,6 @@ class GATDrugEncoder(nn.Module):
         
         # Returns the context-aware atom embeddings via attention weights
         return x
-
-
-# ==========================================
-# GIN Encoder (Graph Isomorphism Network)
-# ==========================================
 class GINDrugEncoder(nn.Module):
     def __init__(self, node_feature_dim, hidden_dim, dropout=0.1):
         super().__init__()
@@ -277,20 +289,40 @@ class GINDrugEncoder(nn.Module):
         return x
 
 class GroundedCrossAttentionModel(nn.Module):
-    def __init__(self, gene_token_indices, hidden_dim=64, num_heads=4, dropout=0.1, gnn_type="GCN"):
+    def __init__(self, gene_token_indices, hidden_dim=64, num_heads=4, dropout=0.1, gnn_type="GCN", molclr_backbone=None, freeze_molclr=True):
         super().__init__()
         self.hidden_dim = hidden_dim
 
+        self.use_molclr = molclr_backbone is not None
+
         self.gene_encoder = ModularTokenEncoder(gene_token_indices, hidden_dim, dropout)
-        
-        if gnn_type == "GCN":
-            self.drug_encoder = GCNDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
-        elif gnn_type == "GAT":
-            self.drug_encoder = GATDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
-        elif gnn_type == "GIN":
-            self.drug_encoder = GINDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
+
+        if self.use_molclr:
+            print("Using pre-trained MolCLR backbone for drug encoding.")
+            self.drug_encoder = molclr_backbone
+            # --- NEU: Adapter-Schicht, um von 300 auf 64 Dimensionen zu kommen ---
+            #self.molclr_proj = nn.Linear(300, hidden_dim)
+            # this is the nonlinear version
+            self.molclr_proj = nn.Sequential(
+                nn.Linear(300, hidden_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim * 2, hidden_dim)
+            )
+
+            if freeze_molclr:
+                print("Freezing MolCLR backbone parameters.")
+                for param in self.drug_encoder.parameters():
+                    param.requires_grad = False
         else:
-            raise ValueError(f"Unknown GNN-Typ: {gnn_type}")
+            if gnn_type == "GCN":
+                self.drug_encoder = GCNDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
+            elif gnn_type == "GAT":
+                self.drug_encoder = GATDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
+            elif gnn_type == "GIN":
+                self.drug_encoder = GINDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
+            else:
+                raise ValueError(f"Unknown GNN-Typ: {gnn_type}")
 
         self.cross_attn_gene_to_drug = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True
@@ -301,23 +333,56 @@ class GroundedCrossAttentionModel(nn.Module):
         self.norm_gene = nn.LayerNorm(hidden_dim)
         self.norm_drug = nn.LayerNorm(hidden_dim)
 
+        # OPTIMIERUNG 2: Feed-Forward Networks (Transformer Architektur)
+        '''self.ffn_gene = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
+        self.ffn_drug = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
+        self.norm_gene_2 = nn.LayerNorm(hidden_dim)
+        self.norm_drug_2 = nn.LayerNorm(hidden_dim)'''
+
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
+            #nn.Sigmoid() # only with MinMax Scaler
         )
 
         self.last_attn_weights = None
 
     def forward(self, x_gene, drug_batch, save_attention=False):
         gene_tokens = self.gene_encoder(x_gene)
-        x_drug_nodes = self.drug_encoder(drug_batch.x, drug_batch.edge_index)
+
+        if self.use_molclr:
+            # preprocessing
+            drug_batch.x = drug_batch.x.long()
+            drug_batch.edge_attr = drug_batch.edge_attr.long()
+
+            drug_batch.x[:, 0] = torch.clamp(drug_batch.x[:, 0], min=0, max=119)
+            drug_batch.x[:, 1] = torch.clamp(drug_batch.x[:, 1], min=0, max=2)
+            drug_batch.edge_attr[:, 0] = torch.clamp(drug_batch.edge_attr[:, 0], min=0, max=3)
+            drug_batch.edge_attr[:, 1] = torch.clamp(drug_batch.edge_attr[:, 1], min=0, max=2)
+
+            x_drug_nodes, _ = self.drug_encoder(drug_batch)
+            x_drug_nodes = self.molclr_proj(x_drug_nodes)
+        
+        else:
+            x_drug_nodes = self.drug_encoder(drug_batch.x, drug_batch.edge_index)
 
         drug_tokens, valid_mask = to_dense_batch(x_drug_nodes, drug_batch.batch)
         padding_mask = ~valid_mask
 
+        # cross attention
         gene_attn_out, gene_attn_weights = self.cross_attn_gene_to_drug(
             query=gene_tokens, key=drug_tokens, value=drug_tokens,
             key_padding_mask=padding_mask
@@ -335,11 +400,12 @@ class GroundedCrossAttentionModel(nn.Module):
 
         gene_context = self.norm_gene(gene_tokens + gene_attn_out)
         drug_context = self.norm_drug(drug_tokens + drug_attn_out)
+
         gene_pooled = gene_context.mean(dim=1)
-
-        drug_sum = (drug_context * valid_mask.unsqueeze(-1)).sum(dim=1)
+        
         num_real_atoms = valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        drug_pooled = drug_sum / num_real_atoms
-
+        drug_pooled = (drug_context * valid_mask.unsqueeze(-1)).sum(dim=1) / num_real_atoms
+        
         fused = torch.cat([gene_pooled, drug_pooled], dim=1)
+
         return self.regressor(fused).squeeze(-1)
