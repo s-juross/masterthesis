@@ -7,6 +7,12 @@ from torch_geometric.utils import to_dense_batch
 import numpy as np
 import random
 from rdkit import Chem
+import matplotlib
+import matplotlib.pyplot as plt
+from rdkit.Chem import rdDepictor
+from rdkit.Chem.Draw import rdMolDraw2D
+from IPython.display import SVG, display
+import seaborn as sns
 
 # ==========================================
 # 1. Dataset & DataLoader
@@ -150,6 +156,174 @@ def set_seed(seed: int):
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)  
     #torch.use_deterministic_algorithms(True, warn_only=True)
+
+def plot_attention_weights(model, test_loader, device, sample_idx=0):
+    # 1. Ein Batch aus dem PyG-Dataloader laden
+    # PyG gibt nur noch ein einziges Batch-Objekt zurück!
+    batch = next(iter(test_loader))
+    batch = batch.to(device)
+
+    # 2. Forward-Pass durchführen (Evaluationsmodus)
+    model.eval()
+    with torch.no_grad():
+        #with torch.amp.autocast(device_type="cuda"): # Mixed Precision beibehalten
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            # Dem Modell das Gen-Profil und den gesamten Graphen übergeben
+            _ = model(batch.gene, batch, save_attention=True)
+
+    # 3. Attention Weights aus dem Modell extrahieren
+    if model.last_attn_weights is None:
+        print("Error: Attention weights were not saved.")
+        return
+
+    attn_dict = model.last_attn_weights
+    gene_to_drug_attn = attn_dict["gene_to_drug"][sample_idx]
+    drug_to_gene_attn = attn_dict["drug_to_gene"][sample_idx]
+
+    # 4. Heatmaps generieren
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Gene-to-Drug
+    sns.heatmap(gene_to_drug_attn, annot=False, cmap="Blues", ax=axes[0])
+    axes[0].set_title(f"Gene-to-Drug Attention (Sample {sample_idx})")
+    # Die X-Achse zeigt jetzt ECHTE ATOME statt abstrakter Fingerprint-Cluster!
+    axes[0].set_xlabel("Drug Tokens (Atoms in the Molecule)")
+    axes[0].set_ylabel("Gene Tokens (Queries)")
+
+    # Drug-to-Gene
+    sns.heatmap(drug_to_gene_attn, annot=False, cmap="Oranges", ax=axes[1])
+    axes[1].set_title(f"Drug-to-Gene Attention (Sample {sample_idx})")
+    axes[1].set_xlabel("Gene Tokens (Keys)")
+    axes[1].set_ylabel("Active Ingredient Tokens (Queries – Atoms in the Molecule)")
+
+    plt.tight_layout()
+    plt.show()
+
+def visualize_atom_attention(mol_smiles, gene_to_drug_attn, num_real_atoms):
+    """
+    Overlays cross-attention weights onto the 2D chemical structure of a molecule.
+    """
+    # Create RDKit molecule and compute 2D coordinates for drawing
+    mol = Chem.MolFromSmiles(mol_smiles)
+    if mol is None:
+        print("Invalid SMILES string.")
+        return
+    rdDepictor.Compute2DCoords(mol)
+
+    # Aggregate attention weights for the atoms
+    # gene_to_drug_attn shape is (Num_Gene_Tokens, Max_Atoms_in_Batch)
+    # We average across all gene tokens (axis=0) to get the global importance of each atom
+    atom_attention = gene_to_drug_attn.mean(axis=0)
+
+    # Slice the array to remove padding (keep only the real atoms of this specific molecule)
+    real_atom_attention = atom_attention[:num_real_atoms]
+
+    # Normalize the attention weights to a range of [0, 1] for coloring
+    min_val = real_atom_attention.min()
+    max_val = real_atom_attention.max()
+    if max_val > min_val:
+        normalized_attn = (real_atom_attention - min_val) / (max_val - min_val)
+    else:
+        normalized_attn = np.zeros_like(real_atom_attention)
+
+    # Map normalized weights to colors using matplotlib's 'Blues' colormap
+    cmap = matplotlib.colormaps.get_cmap('Blues')
+    highlight_atoms = []
+    highlight_colors = {}
+
+    # We only highlight atoms that have at least 10% relative importance to keep the plot clean
+    importance_threshold = 0.10
+
+    for atom_idx, weight in enumerate(normalized_attn):
+        if weight > importance_threshold:
+            highlight_atoms.append(atom_idx)
+            # cmap returns an RGBA tuple, but RDKit expects RGB tuples (R, G, B) between 0 and 1
+            rgba = cmap(weight)
+            highlight_colors[atom_idx] = tuple(rgba[:3])
+
+    # Draw the molecule with RDKit
+    # Increase the canvas size for better resolution
+    drawer = rdMolDraw2D.MolDraw2DSVG(500, 500)
+
+    # Optional: Customize drawing options (e.g., continuous drawing, no atom indices)
+    opts = drawer.drawOptions()
+    opts.clearBackground = False
+
+    drawer.DrawMolecule(
+        mol,
+        highlightAtoms=highlight_atoms,
+        highlightAtomColors=highlight_colors
+    )
+    drawer.FinishDrawing()
+
+    # Display the SVG image directly in the Jupyter Notebook
+    svg_text = drawer.GetDrawingText()
+    display(SVG(svg_text))
+
+def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot=4):
+    model.eval()
+    all_gene_to_drug = []
+    #all_drug_to_gene = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(device)
+
+            with torch.amp.autocast(device_type="cuda"):
+                _ = model(batch.gene, batch, save_attention=True)
+            all_gene_to_drug.append(model.last_attn_weights["gene_to_drug"])
+            #all_drug_to_gene.append(model.last_attn_weights["drug_to_gene"])
+
+    # Shape: (N_total_samples, Num_Query_Tokens, Num_Key_Tokens)
+    g2d = np.concatenate(all_gene_to_drug, axis=0)
+    #d2g = np.concatenate(all_drug_to_gene, axis=0)
+
+    print(f"Samples analyzed in the test set: {len(g2d)}")
+
+    # 2. Statistische Auswertung: Standardabweichung über alle Samples
+    std_g2d = np.std(g2d, axis=0)
+    #std_d2g = np.std(d2g, axis=0)
+
+    # Calculate pairwise correlations between different samples
+    # Flat vectors per sample for Gene-to-Drug:
+    flat_g2d = g2d.reshape(len(g2d), -1)
+    sample_corr = np.corrcoef(flat_g2d[:100]) # Erste 100 Samples
+    avg_corr = np.mean(sample_corr[np.triu_indices_from(sample_corr, k=1)])
+
+    print(f"Moderate correlation between samples: {avg_corr:.4f}")
+    print(f"Number of gene tokens: {len(all_gene_to_drug)}")
+    #print(f"Number of drug tokens: {len(all_drug_to_gene)}")
+    print(f"Maximum standard deviation (gene-to-drug): {std_g2d.max():.4f}")
+    #print(f"Maximum standard deviation (drug-to-gene): {std_d2g.max():.4f}")
+
+    # Variance Heat Map (Where exactly are changes occurring?)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    sns.heatmap(std_g2d, annot=False, fmt=".3f", cmap="magma", ax=axes[0])
+    axes[0].set_title("Standard Deviation Across the Test Set (Gene -> Drug)")
+    axes[0].set_xlabel("Drug Tokens (Keys)")
+    axes[0].set_ylabel("Gene Tokens (Queries)")
+
+    #sns.heatmap(std_d2g, annot=False, fmt=".3f", cmap="magma", ax=axes[1])
+    #axes[1].set_title("Standard Deviation Across the Test Set (Drug -> Gene)")
+    #axes[1].set_xlabel("Gene Tokens (Keys)")
+    #axes[1].set_ylabel("Drug Tokens (Queries)")
+    #plt.tight_layout()
+    #plt.show()
+
+    # 4. Direct visual comparison of N random examples (gene-to-drug)
+    fig, axes = plt.subplots(1, num_samples_to_plot, figsize=(4 * num_samples_to_plot, 3.5))
+    indices = np.random.choice(len(g2d), size=num_samples_to_plot, replace=False)
+
+    for i, idx in enumerate(indices):
+        sns.heatmap(g2d[idx], annot=False, cmap="Blues", ax=axes[i], cbar=False, vmin=0.08, vmax=0.22)
+        axes[i].set_title(f"Sample {idx}")
+        axes[i].set_xlabel("Drug Tokens")
+        if i == 0:
+            axes[i].set_ylabel("Gene Tokens")
+
+    plt.suptitle("Gene-to-Drug Attention for Various Test Samples", y=1.05, fontsize=14)
+    plt.tight_layout()
+    plt.show()
 
 # ==========================================
 # 3. Models
@@ -300,7 +474,7 @@ class GroundedCrossAttentionModel(nn.Module):
         if self.use_molclr:
             print("Using pre-trained MolCLR backbone for drug encoding.")
             self.drug_encoder = molclr_backbone
-            # --- NEU: Adapter-Schicht, um von 300 auf 64 Dimensionen zu kommen ---
+            # linear version
             #self.molclr_proj = nn.Linear(300, hidden_dim)
             # this is the nonlinear version
             self.molclr_proj = nn.Sequential(
