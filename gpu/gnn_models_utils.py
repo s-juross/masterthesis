@@ -7,12 +7,32 @@ from torch_geometric.utils import to_dense_batch
 import numpy as np
 import random
 from rdkit import Chem
+from rdkit.Chem.rdchem import BondType as BT
 import matplotlib
 import matplotlib.pyplot as plt
 from rdkit.Chem import rdDepictor
 from rdkit.Chem.Draw import rdMolDraw2D
 from IPython.display import SVG, display
 import seaborn as sns
+
+# MolCLR-specific constants for atom types, chirality, bond types, and bond directions
+ATOM_LIST = list(range(1, 119))
+CHIRALITY_TO_INDEX = {
+    Chem.rdchem.ChiralType.CHI_UNSPECIFIED: 0,
+    Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW: 1,
+    Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW: 2,
+}
+BOND_TO_INDEX = {
+    BT.SINGLE: 0,
+    BT.DOUBLE: 1,
+    BT.TRIPLE: 2,
+    BT.AROMATIC: 3,
+}
+BONDDIR_TO_INDEX = {
+    Chem.rdchem.BondDir.NONE: 0,
+    Chem.rdchem.BondDir.ENDUPRIGHT: 1,
+    Chem.rdchem.BondDir.ENDDOWNRIGHT: 2,
+}
 
 # ==========================================
 # 1. Dataset & DataLoader
@@ -63,7 +83,7 @@ def make_loaders(X_gen_train, X_chem_train, y_train,
 # ==========================================
 # 2. Utils
 # ==========================================
-
+''' this is the old function where the input coding is allegedly unsuitable for MolCLR
 def smiles_to_graph(smiles: str) -> Data:
     """
     Converts a SMILES string into a PyTorch Geometric Data object.
@@ -111,7 +131,51 @@ def smiles_to_graph(smiles: str) -> Data:
         edge_attr = torch.empty((0, 2), dtype=torch.float32)
 
     data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-    return data
+    return data'''
+
+def smiles_to_graph(smiles: str) -> Data | None:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+    nodes = []
+    for atom in mol.GetAtoms():
+        chirality = atom.GetChiralTag()
+        if chirality not in CHIRALITY_TO_INDEX:
+            raise ValueError(f"Nicht unterstützter MolCLR-Chiralitätstyp: {chirality}")
+
+        # MolCLR verwendet nullbasierte Atomtyp-Indizes:
+        # Atomnummer 1 -> Index 0, Atomnummer 118 -> Index 117.
+        atom_type = ATOM_LIST.index(atom.GetAtomicNum())
+        nodes.append([atom_type, CHIRALITY_TO_INDEX[chirality]])
+
+    edge_indices = []
+    edge_features = []
+    for bond in mol.GetBonds():
+        bond_type = bond.GetBondType()
+        bond_direction = bond.GetBondDir()
+        if bond_type not in BOND_TO_INDEX:
+            raise ValueError(f"Nicht unterstützter MolCLR-Bindungstyp: {bond_type}")
+        if bond_direction not in BONDDIR_TO_INDEX:
+            raise ValueError(f"Nicht unterstützte MolCLR-Bindungsrichtung: {bond_direction}")
+
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        encoded_edge = [BOND_TO_INDEX[bond_type], BONDDIR_TO_INDEX[bond_direction]]
+
+        # MolCLR speichert jede Bindung in beide Richtungen.
+        edge_indices.extend([[i, j], [j, i]])
+        edge_features.extend([encoded_edge, encoded_edge])
+
+    x = torch.tensor(nodes, dtype=torch.long)
+
+    if edge_indices:
+        edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
+        edge_attr = torch.tensor(edge_features, dtype=torch.long)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_attr = torch.empty((0, 2), dtype=torch.long)
+
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 def weighted_mse_loss(pred, target):
     weights = 1.0 + 2.0 * torch.exp(-3.0 * target)
@@ -158,20 +222,19 @@ def set_seed(seed: int):
     #torch.use_deterministic_algorithms(True, warn_only=True)
 
 def plot_attention_weights(model, test_loader, device, sample_idx=0):
-    # 1. Ein Batch aus dem PyG-Dataloader laden
-    # PyG gibt nur noch ein einziges Batch-Objekt zurück!
+    # load one batch
     batch = next(iter(test_loader))
     batch = batch.to(device)
 
-    # 2. Forward-Pass durchführen (Evaluationsmodus)
+    # evaluation mode
     model.eval()
     with torch.no_grad():
         #with torch.amp.autocast(device_type="cuda"): # Mixed Precision beibehalten
-        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
-            # Dem Modell das Gen-Profil und den gesamten Graphen übergeben
+        with torch.no_grad():#.amp.autocast:device_type=device.type, enabled=True):
+            # Pass the gene profile and the entire graph to the model
             _ = model(batch.gene, batch, save_attention=True)
 
-    # 3. Attention Weights aus dem Modell extrahieren
+    # extract attention weights
     if model.last_attn_weights is None:
         print("Error: Attention weights were not saved.")
         return
@@ -180,13 +243,25 @@ def plot_attention_weights(model, test_loader, device, sample_idx=0):
     gene_to_drug_attn = attn_dict["gene_to_drug"][sample_idx]
     drug_to_gene_attn = attn_dict["drug_to_gene"][sample_idx]
 
+    for name, attn in [
+        ("Gene -> Drug", gene_to_drug_attn),
+        ("Drug -> Gene", drug_to_gene_attn),
+    ]:
+        print(f"\n{name}")
+        print("Shape:", attn.shape)
+        print("Min:", np.nanmin(attn))
+        print("Max:", np.nanmax(attn))
+        print("Mean:", np.nanmean(attn))
+        print("NaNs:", np.isnan(attn).sum())
+        print("Sum per query (first 5):",
+            np.sum(attn, axis=-1)[:5])
+
     # 4. Heatmaps generieren
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
     # Gene-to-Drug
     sns.heatmap(gene_to_drug_attn, annot=False, cmap="Blues", ax=axes[0])
     axes[0].set_title(f"Gene-to-Drug Attention (Sample {sample_idx})")
-    # Die X-Achse zeigt jetzt ECHTE ATOME statt abstrakter Fingerprint-Cluster!
     axes[0].set_xlabel("Drug Tokens (Atoms in the Molecule)")
     axes[0].set_ylabel("Gene Tokens (Queries)")
 
@@ -263,7 +338,7 @@ def visualize_atom_attention(mol_smiles, gene_to_drug_attn, num_real_atoms):
 def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot=4):
     model.eval()
     all_gene_to_drug = []
-    #all_drug_to_gene = []
+    all_drug_to_gene = []
 
     with torch.no_grad():
         for batch in test_loader:
@@ -272,17 +347,17 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
             with torch.amp.autocast(device_type="cuda"):
                 _ = model(batch.gene, batch, save_attention=True)
             all_gene_to_drug.append(model.last_attn_weights["gene_to_drug"])
-            #all_drug_to_gene.append(model.last_attn_weights["drug_to_gene"])
+            all_drug_to_gene.append(model.last_attn_weights["drug_to_gene"])
 
     # Shape: (N_total_samples, Num_Query_Tokens, Num_Key_Tokens)
     g2d = np.concatenate(all_gene_to_drug, axis=0)
-    #d2g = np.concatenate(all_drug_to_gene, axis=0)
+    d2g = np.concatenate(all_drug_to_gene, axis=0)
 
     print(f"Samples analyzed in the test set: {len(g2d)}")
 
     # 2. Statistische Auswertung: Standardabweichung über alle Samples
     std_g2d = np.std(g2d, axis=0)
-    #std_d2g = np.std(d2g, axis=0)
+    std_d2g = np.std(d2g, axis=0)
 
     # Calculate pairwise correlations between different samples
     # Flat vectors per sample for Gene-to-Drug:
@@ -292,9 +367,9 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
 
     print(f"Moderate correlation between samples: {avg_corr:.4f}")
     print(f"Number of gene tokens: {len(all_gene_to_drug)}")
-    #print(f"Number of drug tokens: {len(all_drug_to_gene)}")
+    print(f"Number of drug tokens: {len(all_drug_to_gene)}")
     print(f"Maximum standard deviation (gene-to-drug): {std_g2d.max():.4f}")
-    #print(f"Maximum standard deviation (drug-to-gene): {std_d2g.max():.4f}")
+    print(f"Maximum standard deviation (drug-to-gene): {std_d2g.max():.4f}")
 
     # Variance Heat Map (Where exactly are changes occurring?)
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
@@ -303,12 +378,12 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
     axes[0].set_xlabel("Drug Tokens (Keys)")
     axes[0].set_ylabel("Gene Tokens (Queries)")
 
-    #sns.heatmap(std_d2g, annot=False, fmt=".3f", cmap="magma", ax=axes[1])
-    #axes[1].set_title("Standard Deviation Across the Test Set (Drug -> Gene)")
-    #axes[1].set_xlabel("Gene Tokens (Keys)")
-    #axes[1].set_ylabel("Drug Tokens (Queries)")
-    #plt.tight_layout()
-    #plt.show()
+    sns.heatmap(std_d2g, annot=False, fmt=".3f", cmap="magma", ax=axes[1])
+    axes[1].set_title("Standard Deviation Across the Test Set (Drug -> Gene)")
+    axes[1].set_xlabel("Gene Tokens (Keys)")
+    axes[1].set_ylabel("Drug Tokens (Queries)")
+    plt.tight_layout()
+    plt.show()
 
     # 4. Direct visual comparison of N random examples (gene-to-drug)
     fig, axes = plt.subplots(1, num_samples_to_plot, figsize=(4 * num_samples_to_plot, 3.5))
@@ -475,14 +550,13 @@ class GroundedCrossAttentionModel(nn.Module):
             print("Using pre-trained MolCLR backbone for drug encoding.")
             self.drug_encoder = molclr_backbone
             # linear version
-            #self.molclr_proj = nn.Linear(300, hidden_dim)
+            self.molclr_proj = nn.Linear(300, hidden_dim)
             # this is the nonlinear version
-            self.molclr_proj = nn.Sequential(
-                nn.Linear(300, hidden_dim * 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim * 2, hidden_dim)
-            )
+            #self.molclr_proj = nn.Sequential(
+            #    nn.Linear(300, hidden_dim * 2),
+            #    nn.ReLU(),
+            #    nn.Dropout(dropout),
+            #    nn.Linear(hidden_dim * 2, hidden_dim))
 
             if freeze_molclr:
                 print("Freezing MolCLR backbone parameters.")
@@ -507,21 +581,16 @@ class GroundedCrossAttentionModel(nn.Module):
         self.norm_gene = nn.LayerNorm(hidden_dim)
         self.norm_drug = nn.LayerNorm(hidden_dim)
 
-        # OPTIMIERUNG 2: Feed-Forward Networks (Transformer Architektur)
-        '''self.ffn_gene = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim)
+        self.attention_pool_gene = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
         )
-        self.ffn_drug = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim)
+        self.attention_pool_drug = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
         )
-        self.norm_gene_2 = nn.LayerNorm(hidden_dim)
-        self.norm_drug_2 = nn.LayerNorm(hidden_dim)'''
 
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -572,13 +641,20 @@ class GroundedCrossAttentionModel(nn.Module):
                 'drug_to_gene': drug_attn_weights.detach().cpu().numpy()
             }
 
-        gene_context = self.norm_gene(gene_tokens + gene_attn_out)
+        gene_context = self.norm_gene(gene_tokens + gene_attn_out) # residual connection
         drug_context = self.norm_drug(drug_tokens + drug_attn_out)
 
-        gene_pooled = gene_context.mean(dim=1)
-        
-        num_real_atoms = valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
-        drug_pooled = (drug_context * valid_mask.unsqueeze(-1)).sum(dim=1) / num_real_atoms
+        #gene_pooled = gene_context.mean(dim=1) # global average pooling
+        #num_real_atoms = valid_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        #drug_pooled = (drug_context * valid_mask.unsqueeze(-1)).sum(dim=1) / num_real_atoms
+
+        # weighted sum for pooling
+        gene_attn_pool_weights = torch.softmax(self.attention_pool_gene(gene_context), dim=1)
+        gene_pooled = (gene_context * gene_attn_pool_weights).sum(dim=1)
+        drug_scores = self.attention_pool_drug(drug_context) # Shape [Batch, Max_Atoms, 1]
+        drug_scores = drug_scores.masked_fill(padding_mask.unsqueeze(-1), -1e9)
+        drug_attn_pool_weights = torch.softmax(drug_scores, dim=1)
+        drug_pooled = (drug_context * drug_attn_pool_weights).sum(dim=1)
         
         fused = torch.cat([gene_pooled, drug_pooled], dim=1)
 
