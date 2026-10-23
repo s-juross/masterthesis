@@ -400,10 +400,49 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
     plt.tight_layout()
     plt.show()
 
+def check_index_range(name, values, min_value, max_value):
+    if values.numel() == 0:
+        return
+
+    actual_min = values.min().item()
+    actual_max = values.max().item()
+
+    if actual_min < min_value or actual_max > max_value:
+        raise ValueError(
+            f"{name} outside the permitted area "
+            f"[{min_value}, {max_value}]: "
+            f"found [{actual_min}, {actual_max}]"
+        )
+
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0, path='best_model.pth'):
+        """
+        patience (int): Wie viele Epochen ohne Verbesserung gewartet wird.
+        min_delta (float): Minimale Änderung, die als Verbesserung zählt.
+        path (str): Pfad, unter dem das beste Modell gespeichert wird.
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.path = path
+        self.counter = 0
+        self.best_loss = np.inf
+        self.early_stop = False
+
+    def __call__(self, val_loss, model):
+        # Prüfen, ob der aktuelle Loss signifikant besser ist als der bisher beste
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            # Speichere die Gewichte des besten Modells
+            torch.save(model.state_dict(), self.path)
+        else:
+            self.counter += 1
+            print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
 # ==========================================
 # 3. Models
 # ==========================================
-
 class ModularTokenEncoder(nn.Module):
     """Encodes disjoint subsets of feature columns into separate functional tokens efficiently."""
     def __init__(self, feature_subsets_indices, hidden_dim=64, dropout=0.1):
@@ -550,13 +589,13 @@ class GroundedCrossAttentionModel(nn.Module):
             print("Using pre-trained MolCLR backbone for drug encoding.")
             self.drug_encoder = molclr_backbone
             # linear version
-            self.molclr_proj = nn.Linear(300, hidden_dim)
+            #self.molclr_proj = nn.Linear(300, hidden_dim)
             # this is the nonlinear version
-            #self.molclr_proj = nn.Sequential(
-            #    nn.Linear(300, hidden_dim * 2),
-            #    nn.ReLU(),
-            #    nn.Dropout(dropout),
-            #    nn.Linear(hidden_dim * 2, hidden_dim))
+            self.molclr_proj = nn.Sequential(
+                nn.Linear(300, hidden_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim * 2, hidden_dim))
 
             if freeze_molclr:
                 print("Freezing MolCLR backbone parameters.")
@@ -564,20 +603,18 @@ class GroundedCrossAttentionModel(nn.Module):
                     param.requires_grad = False
         else:
             if gnn_type == "GCN":
-                self.drug_encoder = GCNDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
+                self.drug_encoder = GCNDrugEncoder(node_feature_dim=2, hidden_dim=hidden_dim, dropout=dropout)
             elif gnn_type == "GAT":
-                self.drug_encoder = GATDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
+                self.drug_encoder = GATDrugEncoder(node_feature_dim=2, hidden_dim=hidden_dim, dropout=dropout)
             elif gnn_type == "GIN":
-                self.drug_encoder = GINDrugEncoder(node_feature_dim=4, hidden_dim=hidden_dim, dropout=dropout)
+                self.drug_encoder = GINDrugEncoder(node_feature_dim=2, hidden_dim=hidden_dim, dropout=dropout)
             else:
                 raise ValueError(f"Unknown GNN-Typ: {gnn_type}")
 
         self.cross_attn_gene_to_drug = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
+            embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.cross_attn_drug_to_gene = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
+            embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
         self.norm_gene = nn.LayerNorm(hidden_dim)
         self.norm_drug = nn.LayerNorm(hidden_dim)
 
@@ -603,24 +640,28 @@ class GroundedCrossAttentionModel(nn.Module):
 
         self.last_attn_weights = None
 
+    #https://www.geeksforgeeks.org/deep-learning/understanding-the-forward-function-output-in-pytorch/
     def forward(self, x_gene, drug_batch, save_attention=False):
         gene_tokens = self.gene_encoder(x_gene)
 
         if self.use_molclr:
             # preprocessing
-            drug_batch.x = drug_batch.x.long()
-            drug_batch.edge_attr = drug_batch.edge_attr.long()
-
-            drug_batch.x[:, 0] = torch.clamp(drug_batch.x[:, 0], min=0, max=119)
-            drug_batch.x[:, 1] = torch.clamp(drug_batch.x[:, 1], min=0, max=2)
-            drug_batch.edge_attr[:, 0] = torch.clamp(drug_batch.edge_attr[:, 0], min=0, max=3)
-            drug_batch.edge_attr[:, 1] = torch.clamp(drug_batch.edge_attr[:, 1], min=0, max=2)
+            drug_batch.x = drug_batch.x.long() # Convert Atomic Features to Indices
+            drug_batch.edge_attr = drug_batch.edge_attr.long() # Convert Bond Features to Indices
+            check_index_range("Atomic Type", drug_batch.x[:, 0], 0, 118)
+            check_index_range("Chirality", drug_batch.x[:, 1], 0, 2)
+            check_index_range("Binding Type", drug_batch.edge_attr[:, 0], 0, 3)
+            check_index_range("Binding Direction", drug_batch.edge_attr[:, 1], 0, 2)
+            #drug_batch.x[:, 0] = torch.clamp(drug_batch.x[:, 0], min=0, max=118) # hier könnte Fehler entstehen, weil ich einfach so die Grenzen setze. Für korrekt codierte Daten sollten sie nichts verändern, falsche Werte aber könnten fälschlicherweise auf Randwerte abbilden.
+            #drug_batch.x[:, 1] = torch.clamp(drug_batch.x[:, 1], min=0, max=2)
+            #drug_batch.edge_attr[:, 0] = torch.clamp(drug_batch.edge_attr[:, 0], min=0, max=3)
+            #drug_batch.edge_attr[:, 1] = torch.clamp(drug_batch.edge_attr[:, 1], min=0, max=2)
 
             x_drug_nodes, _ = self.drug_encoder(drug_batch)
             x_drug_nodes = self.molclr_proj(x_drug_nodes)
         
         else:
-            x_drug_nodes = self.drug_encoder(drug_batch.x, drug_batch.edge_index)
+            x_drug_nodes = self.drug_encoder(drug_batch.x.float(), drug_batch.edge_index)
 
         drug_tokens, valid_mask = to_dense_batch(x_drug_nodes, drug_batch.batch)
         padding_mask = ~valid_mask
@@ -628,12 +669,10 @@ class GroundedCrossAttentionModel(nn.Module):
         # cross attention
         gene_attn_out, gene_attn_weights = self.cross_attn_gene_to_drug(
             query=gene_tokens, key=drug_tokens, value=drug_tokens,
-            key_padding_mask=padding_mask
-        )
+            key_padding_mask=padding_mask)
         
         drug_attn_out, drug_attn_weights = self.cross_attn_drug_to_gene(
-            query=drug_tokens, key=gene_tokens, value=gene_tokens
-        )
+            query=drug_tokens, key=gene_tokens, value=gene_tokens)
 
         if save_attention:
             self.last_attn_weights = {
@@ -649,12 +688,14 @@ class GroundedCrossAttentionModel(nn.Module):
         #drug_pooled = (drug_context * valid_mask.unsqueeze(-1)).sum(dim=1) / num_real_atoms
 
         # weighted sum for pooling
-        gene_attn_pool_weights = torch.softmax(self.attention_pool_gene(gene_context), dim=1)
-        gene_pooled = (gene_context * gene_attn_pool_weights).sum(dim=1)
+        gene_scores = self.attention_pool_gene(gene_context)
+        gene_weights = torch.softmax(gene_scores, dim=1)
+        gene_pooled = (gene_context * gene_weights).sum(dim=1)
+
         drug_scores = self.attention_pool_drug(drug_context) # Shape [Batch, Max_Atoms, 1]
         drug_scores = drug_scores.masked_fill(padding_mask.unsqueeze(-1), -1e9)
-        drug_attn_pool_weights = torch.softmax(drug_scores, dim=1)
-        drug_pooled = (drug_context * drug_attn_pool_weights).sum(dim=1)
+        drug_weights = torch.softmax(drug_scores, dim=1)
+        drug_pooled = (drug_context * drug_weights).sum(dim=1)
         
         fused = torch.cat([gene_pooled, drug_pooled], dim=1)
 
