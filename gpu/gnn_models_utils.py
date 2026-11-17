@@ -187,17 +187,13 @@ def build_pyg_dataset(smiles_array, gen_array, y_array, cache=None, use_cache=Tr
     for i in range(len(smiles_array)):
         smiles = smiles_array[i]
         
-        # Entweder aus dem Cache holen oder from scratch bauen
         if use_cache and cache is not None:
             base_data = cache.get(smiles)
-            # Wichtig: Wenn er aus dem Cache kommt, müssen wir ihn klonen, 
-            # damit wir nicht das Cache-Original überschreiben
             if base_data is not None:
                 data = base_data.clone()
             else:
                 data = None
         else:
-            # Graph direkt neu berechnen (kein Klonen nötig, da es ein neues Objekt ist)
             data = smiles_to_graph(smiles)
             
         if data is not None:
@@ -225,6 +221,11 @@ def plot_attention_weights(model, test_loader, device, sample_idx=0):
     # load one batch
     batch = next(iter(test_loader))
     batch = batch.to(device)
+    if not 0 <= sample_idx < batch.num_graphs:
+        raise IndexError(
+            f"sample_idx must be between 0 and {batch.num_graphs - 1}, "
+            f"got {sample_idx}."
+        )
 
     # evaluation mode
     model.eval()
@@ -240,8 +241,9 @@ def plot_attention_weights(model, test_loader, device, sample_idx=0):
         return
 
     attn_dict = model.last_attn_weights
-    gene_to_drug_attn = attn_dict["gene_to_drug"][sample_idx]
-    drug_to_gene_attn = attn_dict["drug_to_gene"][sample_idx]
+    num_atoms = int(batch.ptr[sample_idx + 1] - batch.ptr[sample_idx])
+    gene_to_drug_attn = attn_dict["gene_to_drug"][sample_idx, :, :num_atoms]
+    drug_to_gene_attn = attn_dict["drug_to_gene"][sample_idx, :num_atoms, :]
 
     for name, attn in [
         ("Gene -> Drug", gene_to_drug_attn),
@@ -344,7 +346,7 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
         for batch in test_loader:
             batch = batch.to(device)
 
-            with torch.amp.autocast(device_type="cuda"):
+            with torch.amp.autocast(device_type=device.type, enabled=False):
                 _ = model(batch.gene, batch, save_attention=True)
             all_gene_to_drug.append(model.last_attn_weights["gene_to_drug"])
             all_drug_to_gene.append(model.last_attn_weights["drug_to_gene"])
@@ -390,7 +392,16 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
     indices = np.random.choice(len(g2d), size=num_samples_to_plot, replace=False)
 
     for i, idx in enumerate(indices):
-        sns.heatmap(g2d[idx], annot=False, cmap="Blues", ax=axes[i], cbar=False, vmin=0.08, vmax=0.22)
+        vmax = np.percentile(g2d, 99)
+        sns.heatmap(
+            g2d[idx],
+            cmap="Blues",
+            vmin=0,
+            vmax=vmax,
+            annot=False,
+            ax=axes[i],
+            cbar=False
+        )
         axes[i].set_title(f"Sample {idx}")
         axes[i].set_xlabel("Drug Tokens")
         if i == 0:
@@ -399,6 +410,7 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
     plt.suptitle("Gene-to-Drug Attention for Various Test Samples", y=1.05, fontsize=14)
     plt.tight_layout()
     plt.show()
+
 
 def check_index_range(name, values, min_value, max_value):
     if values.numel() == 0:
@@ -440,6 +452,7 @@ class EarlyStopping:
             print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
+
 # ==========================================
 # 3. Models
 # ==========================================
@@ -632,8 +645,8 @@ class GroundedCrossAttentionModel(nn.Module):
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, 1),
             #nn.Sigmoid() # only with MinMax Scaler
         )
@@ -652,11 +665,10 @@ class GroundedCrossAttentionModel(nn.Module):
             check_index_range("Chirality", drug_batch.x[:, 1], 0, 2)
             check_index_range("Binding Type", drug_batch.edge_attr[:, 0], 0, 3)
             check_index_range("Binding Direction", drug_batch.edge_attr[:, 1], 0, 2)
-            #drug_batch.x[:, 0] = torch.clamp(drug_batch.x[:, 0], min=0, max=118) # hier könnte Fehler entstehen, weil ich einfach so die Grenzen setze. Für korrekt codierte Daten sollten sie nichts verändern, falsche Werte aber könnten fälschlicherweise auf Randwerte abbilden.
+            #drug_batch.x[:, 0] = torch.clamp(drug_batch.x[:, 0], min=0, max=118) # hier könnte Fehler entstehen, weil ich einfach so die Grenzen setze. 
             #drug_batch.x[:, 1] = torch.clamp(drug_batch.x[:, 1], min=0, max=2)
             #drug_batch.edge_attr[:, 0] = torch.clamp(drug_batch.edge_attr[:, 0], min=0, max=3)
             #drug_batch.edge_attr[:, 1] = torch.clamp(drug_batch.edge_attr[:, 1], min=0, max=2)
-
             x_drug_nodes, _ = self.drug_encoder(drug_batch)
             x_drug_nodes = self.molclr_proj(x_drug_nodes)
         
