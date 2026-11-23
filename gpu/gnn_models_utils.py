@@ -542,11 +542,6 @@ class GATDrugEncoder(nn.Module):
 class GINDrugEncoder(nn.Module):
     def __init__(self, node_feature_dim, hidden_dim, dropout=0.1):
         super().__init__()
-        
-        # GIN requires a neural network (MLP) for each layer to update node representations.
-        # This makes it theoretically as powerful as the Weisfeiler-Lehman graph test.
-        
-        # MLP for Layer 1
         nn1 = nn.Sequential(
             nn.Linear(node_feature_dim, hidden_dim),
             nn.ReLU(),
@@ -555,7 +550,6 @@ class GINDrugEncoder(nn.Module):
         # train_eps=True allows the model to learn the central node weighting (epsilon)
         self.conv1 = GINConv(nn1, train_eps=True)
 
-        # MLP for Layer 2
         nn2 = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -563,7 +557,6 @@ class GINDrugEncoder(nn.Module):
         )
         self.conv2 = GINConv(nn2, train_eps=True)
 
-        # MLP for Layer 3
         nn3 = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -575,7 +568,6 @@ class GINDrugEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, edge_index):
-        # Pass node features through the GIN layers and MLPs
         x = self.conv1(x, edge_index)
         x = self.relu(x)
         x = self.dropout(x)
@@ -590,7 +582,7 @@ class GINDrugEncoder(nn.Module):
         return x
 
 class GroundedCrossAttentionModel(nn.Module):
-    def __init__(self, gene_token_indices, hidden_dim=64, num_heads=4, dropout=0.1, gnn_type="GCN", molclr_backbone=None, freeze_molclr=True):
+    def __init__(self, gene_token_indices, hidden_dim=64, num_heads=4, dropout=0.1, gnn_type="GCN", node_feature_dim=2, molclr_backbone=None, freeze_molclr=True):
         super().__init__()
         self.hidden_dim = hidden_dim
 
@@ -616,11 +608,11 @@ class GroundedCrossAttentionModel(nn.Module):
                     param.requires_grad = False
         else:
             if gnn_type == "GCN":
-                self.drug_encoder = GCNDrugEncoder(node_feature_dim=2, hidden_dim=hidden_dim, dropout=dropout)
+                self.drug_encoder = GCNDrugEncoder(node_feature_dim=node_feature_dim, hidden_dim=hidden_dim, dropout=dropout)
             elif gnn_type == "GAT":
-                self.drug_encoder = GATDrugEncoder(node_feature_dim=2, hidden_dim=hidden_dim, dropout=dropout)
+                self.drug_encoder = GATDrugEncoder(node_feature_dim=node_feature_dim, hidden_dim=hidden_dim, dropout=dropout)
             elif gnn_type == "GIN":
-                self.drug_encoder = GINDrugEncoder(node_feature_dim=2, hidden_dim=hidden_dim, dropout=dropout)
+                self.drug_encoder = GINDrugEncoder(node_feature_dim=node_feature_dim, hidden_dim=hidden_dim, dropout=dropout)
             else:
                 raise ValueError(f"Unknown GNN-Typ: {gnn_type}")
 

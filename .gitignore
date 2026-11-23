@@ -24,3 +24,4 @@ best_model_seed_42.pt
 best_grounded_model.pt
 .DS_Store
 *.py[cod]
+assignment_thesis*
