@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, GATConv, GINConv
+from torch_geometric.nn import GCNConv, GATConv, GINConv, global_mean_pool, global_max_pool, global_add_pool
 from torch_geometric.utils import to_dense_batch
 import numpy as np
 import random
@@ -411,7 +411,6 @@ def evaluate_attention_diversity(model, test_loader, device, num_samples_to_plot
     plt.tight_layout()
     plt.show()
 
-
 def check_index_range(name, values, min_value, max_value):
     if values.numel() == 0:
         return
@@ -481,18 +480,38 @@ class ModularTokenEncoder(nn.Module):
             sub_x = x[:, idx]
             token_list.append(proj(sub_x))
         return torch.stack(token_list, dim=1)
+class CategoricalAtomEncoder(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.atom_type_embedding = nn.Embedding(len(ATOM_LIST), hidden_dim)
+        self.chirality_embedding = nn.Embedding(len(CHIRALITY_TO_INDEX), hidden_dim)
+
+    def forward(self, x):
+        if x.ndim != 2 or x.size(1) != 2:
+            raise ValueError(
+                f"Expected atom features with shape [num_atoms, 2], got {tuple(x.shape)}"
+            )
+
+        atom_type = x[:, 0].long()
+        chirality = x[:, 1].long()
+        return self.atom_type_embedding(atom_type) + self.chirality_embedding(chirality)
 
 class GCNDrugEncoder(nn.Module):
-    def __init__(self, node_feature_dim, hidden_dim, dropout=0.1):
+    def __init__(self, node_feature_dim, hidden_dim, dropout=0.1, pool="mean"):
         super().__init__()
-        self.conv1 = GCNConv(node_feature_dim, hidden_dim)
+        if node_feature_dim != 2:
+            raise ValueError(f"Expected 2 categorical atom features, got {node_feature_dim}")
+        self.atom_encoder = CategoricalAtomEncoder(hidden_dim)
+        self.conv1 = GCNConv(hidden_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
         self.conv3 = GCNConv(hidden_dim, hidden_dim)
 
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
+        self.pool = global_mean_pool if pool == "mean" else global_max_pool if pool == "max" else global_add_pool
 
-    def forward(self, x, edge_index):
+    def forward(self, data):
+        x, edge_index = self.atom_encoder(data.x), data.edge_index
         x = self.conv1(x, edge_index)
         x = self.relu(x)
         x = self.dropout(x)
@@ -501,49 +520,51 @@ class GCNDrugEncoder(nn.Module):
         x = self.relu(x)
         x = self.dropout(x)
 
-        x = self.conv3(x, edge_index)
-        return x
+        h_node = self.conv3(x, edge_index)
+        h_graph = self.pool(h_node, data.batch)
+        return h_node, h_graph
 class GATDrugEncoder(nn.Module):
-    def __init__(self, node_feature_dim, hidden_dim, dropout=0.1, heads=2):
+    def __init__(self, node_feature_dim, hidden_dim, dropout=0.1, heads=2, pool="mean", edge_dim=2):
         super().__init__()
-        
+        if node_feature_dim != 2:
+            raise ValueError(f"Expected 2 categorical atom features, got {node_feature_dim}")
+        self.atom_encoder = CategoricalAtomEncoder(hidden_dim)
         # Calculate the output dimension per head. 
-        # We concatenate the heads, so out_channels * heads must equal hidden_dim.
         out_channels = hidden_dim // heads
-        
-        # Layer 1: Applies multi-head graph attention.
-        # Dropout here is applied to the attention coefficients.
-        self.conv1 = GATConv(node_feature_dim, out_channels, heads=heads, dropout=dropout)
-        
-        # Layer 2: Hidden attention layer.
-        self.conv2 = GATConv(hidden_dim, out_channels, heads=heads, dropout=dropout)
-        
-        # Layer 3: Final layer. We use a single head and disable concatenation 
-        # to ensure the output dimension perfectly matches hidden_dim.
-        self.conv3 = GATConv(hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout)
+        # Applies multi-head graph attention.
+        self.conv1 = GATConv(hidden_dim, out_channels, heads=heads, dropout=dropout, edge_dim=edge_dim)
+        # Hidden attention layer.
+        self.conv2 = GATConv(hidden_dim, out_channels, heads=heads, dropout=dropout, edge_dim=edge_dim)
+        # Single head and disable concatenation 
+        self.conv3 = GATConv(hidden_dim, hidden_dim, heads=heads, concat=False, dropout=dropout, edge_dim=edge_dim)
 
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
+        self.pool = global_mean_pool if pool == "mean" else global_max_pool if pool == "max" else global_add_pool
 
-    def forward(self, x, edge_index):
+    def forward(self, data):
+        x, edge_index = self.atom_encoder(data.x), data.edge_index
         # Pass node features and edge indices through the attention layers
-        x = self.conv1(x, edge_index)
+        # edge attributes is for the type of bond
+        x = self.conv1(x, edge_index, edge_attr=data.edge_attr.float())
         x = self.relu(x)
         x = self.dropout(x)
 
-        x = self.conv2(x, edge_index)
+        x = self.conv2(x, edge_index, edge_attr=data.edge_attr.float())
         x = self.relu(x)
         x = self.dropout(x)
 
-        x = self.conv3(x, edge_index)
-        
-        # Returns the context-aware atom embeddings via attention weights
-        return x
+        h_node = self.conv3(x, edge_index, edge_attr=data.edge_attr.float())
+        h_graph = self.pool(h_node, data.batch)
+        return h_node, h_graph
 class GINDrugEncoder(nn.Module):
-    def __init__(self, node_feature_dim, hidden_dim, dropout=0.1):
+    def __init__(self, node_feature_dim, hidden_dim, dropout=0.1, pool="mean"):
         super().__init__()
+        if node_feature_dim != 2:
+            raise ValueError(f"Expected 2 categorical atom features, got {node_feature_dim}")
+        self.atom_encoder = CategoricalAtomEncoder(hidden_dim)
         nn1 = nn.Sequential(
-            nn.Linear(node_feature_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
@@ -566,8 +587,10 @@ class GINDrugEncoder(nn.Module):
 
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
+        self.pool = global_mean_pool if pool == "mean" else global_max_pool if pool == "max" else global_add_pool
 
-    def forward(self, x, edge_index):
+    def forward(self, data):
+        x, edge_index = self.atom_encoder(data.x), data.edge_index
         x = self.conv1(x, edge_index)
         x = self.relu(x)
         x = self.dropout(x)
@@ -576,10 +599,9 @@ class GINDrugEncoder(nn.Module):
         x = self.relu(x)
         x = self.dropout(x)
 
-        x = self.conv3(x, edge_index)
-        
-        # Returns highly expressive atom embeddings 
-        return x
+        h_node = self.conv3(x, edge_index)
+        h_graph = self.pool(h_node, data.batch)
+        return h_node, h_graph
 
 class GroundedCrossAttentionModel(nn.Module):
     def __init__(self, gene_token_indices, hidden_dim=64, num_heads=4, dropout=0.1, gnn_type="GCN", node_feature_dim=2, molclr_backbone=None, freeze_molclr=True):
@@ -665,7 +687,7 @@ class GroundedCrossAttentionModel(nn.Module):
             x_drug_nodes = self.molclr_proj(x_drug_nodes)
         
         else:
-            x_drug_nodes = self.drug_encoder(drug_batch.x.float(), drug_batch.edge_index)
+            x_drug_nodes, _ = self.drug_encoder(drug_batch)
 
         drug_tokens, valid_mask = to_dense_batch(x_drug_nodes, drug_batch.batch)
         padding_mask = ~valid_mask
