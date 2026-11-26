@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, GATConv, GINConv, global_mean_pool, global_max_pool, global_add_pool
 from torch_geometric.utils import to_dense_batch
 import numpy as np
 import random
+import pandas as pd
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
 import matplotlib
@@ -425,6 +427,52 @@ def check_index_range(name, values, min_value, max_value):
             f"found [{actual_min}, {actual_max}]"
         )
 
+@torch.no_grad()
+def add_gnn_embeddings_to_df(df, model, device, batch_size=64):
+    """
+    Calculates the graph embedding once for each unique SMILES
+    and appends the columns 'GNN_0' ... 'GNN_d' to a copy of df.
+    """
+    model = model.to(device).eval()
+    
+    unique_smiles = df['SMILES'].dropna().unique()
+    graphs = []
+    valid_smiles = []
+    failed_smiles = []
+    
+    for s in unique_smiles:
+        g = smiles_to_graph(s)
+        if g is not None:
+            graphs.append(g)
+            valid_smiles.append(s)
+        else:
+            failed_smiles.append(s)
+            
+    if failed_smiles:
+        print(f"Warning: {len(failed_smiles)} SMILES could not be converted to graphs.")
+    
+    # In Batches through the GNN
+    loader = PyGDataLoader(graphs, batch_size=batch_size, shuffle=False)
+    all_embs = []
+    
+    for batch in loader:
+        batch = batch.to(device)
+        _, h_graph = model(batch)
+        all_embs.append(h_graph.cpu().numpy())
+        
+    emb_matrix = np.vstack(all_embs).astype(np.float32)
+    emb_cols = [f'GNN_{i}' for i in range(emb_matrix.shape[1])]
+    
+    # Map back to the complete DataFrame using SMILES
+    emb_lookup = pd.DataFrame(emb_matrix, columns=emb_cols)
+    emb_lookup['SMILES'] = valid_smiles
+    
+    df_clean = df.drop(columns=[c for c in df.columns if c.startswith('GNN_')], errors='ignore')
+    df_merged = df_clean.merge(emb_lookup, on='SMILES', how='inner')
+    
+    print(f"Embeddings created: {emb_matrix.shape[1]} dimensions for {len(valid_smiles)} unique active ingredients.")
+    return df_merged
+
 class EarlyStopping:
     def __init__(self, patience=7, min_delta=0, path='best_model.pth'):
         """
@@ -688,6 +736,60 @@ class GroundedCrossAttentionModel(nn.Module):
         
         else:
             x_drug_nodes, _ = self.drug_encoder(drug_batch)
+
+
+    import torch
+
+class MultimodalEarlyFusionNet(nn.Module):
+    """
+    End-to-End Early Fusion Network:
+    - drug_encoder: GNN (GCN, GIN, GAT, or MolCLR) -> returns (h_node, h_graph)
+    - genomics_encoder: MLP for gene expression (+ pharmacophores, if applicable)
+    - fusion_head: Trainable regression head (replaces Random Forest / ElasticNet)
+    """
+    def __init__(
+        self,
+        drug_encoder: nn.Module,
+        genomics_dim: int,
+        drug_dim: int = 128,
+        cell_dim: int = 128,
+        hidden_dim: int = 128,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.drug_encoder = drug_encoder
+
+        # Genomics branch: compresses the gene features to the same scale as the GNN
+        self.genomics_encoder = nn.Sequential(
+            nn.Linear(genomics_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, cell_dim),
+            nn.BatchNorm1d(cell_dim),
+            nn.ReLU(),
+        )
+
+        # Early-Fusion-Head: combines [h_drug, h_cell] and predicts LN_IC50
+        self.fusion_head = nn.Sequential(
+            nn.Linear(drug_dim + cell_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, graph_batch, genomics_x):
+        _, h_drug = self.drug_encoder(graph_batch)
+
+        h_cell = self.genomics_encoder(genomics_x.float())
+
+        fused = torch.cat([h_drug, h_cell], dim=1)
+
+        pred = self.fusion_head(fused).squeeze(-1)
+        return pred
 
         drug_tokens, valid_mask = to_dense_batch(x_drug_nodes, drug_batch.batch)
         padding_mask = ~valid_mask
